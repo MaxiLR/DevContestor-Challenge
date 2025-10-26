@@ -12,7 +12,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 COPY . .
 
-RUN playwright install firefox
+RUN uv run playwright install firefox
 
 EXPOSE 8000
 
