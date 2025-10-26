@@ -1,3 +1,5 @@
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue?logo=python)](https://www.python.org/) [![FastAPI](https://img.shields.io/badge/FastAPI-async-green?logo=fastapi)](https://fastapi.tiangolo.com/) [![Playwright](https://img.shields.io/badge/Playwright-firefox-lightgrey?logo=playwright)](https://playwright.dev/) [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker)](https://www.docker.com/)
+
 # Operation Point Break
 
 American Airlines hides the side-by-side comparison that would show whether cash or award bookings are the better deal. This project automates those checks and exposes the results through a simple FastAPI service.
