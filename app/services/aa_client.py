@@ -59,7 +59,7 @@ def fetch_itinerary(
         browser = playwright.firefox.launch(headless=True)
         page = browser.new_page()
         page.goto("https://www.aa.com/booking/choose-flights/1")
-        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_selector("h1")
 
         js_code = f"""
         async () => {{
@@ -119,7 +119,7 @@ def fetch_itinerary(
     status = result.get("status")
     if isinstance(status, int) and status >= 400:
         raise RuntimeError(
-            f"AA API responded with HTTP {status}: {result.get('statusText')}"
+            f'AA API responded with HTTP {status}: {result.get("body", "")}'
         )
 
     body_text = result.get("body")
