@@ -1,19 +1,24 @@
 import json
+from threading import Lock
 from typing import Any, Dict
 
-from playwright.sync_api import sync_playwright
-
 from app.core.constants import API_URL
+from app.services.browser_manager import ensure_browser_started, get_bootstrap_page
+
+_request_lock = Lock()
 
 
-def fetch_itinerary(
+def get_itinerary(
     origin: str,
     destination: str,
     date: str,
     passengers: int,
     award_search: bool,
 ) -> Dict[str, Any]:
-    """Invoke AA's itinerary search from within a Playwright browser context."""
+    """Invoke AA's itinerary search using the shared Playwright browser."""
+
+    ensure_browser_started()
+    page = get_bootstrap_page()
 
     payload = json.dumps(
         {
@@ -55,60 +60,54 @@ def fetch_itinerary(
         }
     )
 
-    with sync_playwright() as playwright:
-        browser = playwright.firefox.launch(headless=True)
-        page = browser.new_page()
-        page.goto("https://www.aa.com/booking/choose-flights/1")
-        page.wait_for_selector("h1")
+    js_code = f"""
+    async () => {{
+        const apiUrl = "{API_URL}";
+        const body = {payload};
 
-        js_code = f"""
-        async () => {{
-            const apiUrl = "{API_URL}";
-            const body = {payload};
+        const headers = {{
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json',
+            'origin': location.origin,
+            'referer': location.href
+        }};
 
-            const headers = {{
-                'accept': 'application/json, text/plain, */*',
-                'content-type': 'application/json',
-                'origin': location.origin,
-                'referer': location.href
-            }};
+        try {{
+            const res = await fetch(apiUrl, {{
+                method: 'POST',
+                credentials: 'include',
+                headers,
+                body: JSON.stringify(body),
+            }});
+            const text = await res.text();
 
+            let summary = null;
             try {{
-                const res = await fetch(apiUrl, {{
-                    method: 'POST',
-                    credentials: 'include',
-                    headers,
-                    body: JSON.stringify(body),
-                }});
-                const text = await res.text();
-
-                let summary = null;
-                try {{
-                    const parsed = JSON.parse(text);
-                    summary = {{
-                        sessionId: parsed?.responseMetadata?.sessionId || null,
-                        solutionSet: parsed?.responseMetadata?.solutionSet || null,
-                        sliceCount: parsed?.responseMetadata?.sliceCount || null,
-                        products: parsed?.products || null,
-                    }};
-                }} catch {{}}
-
-                return {{
-                    status: res.status,
-                    statusText: res.statusText,
-                    url: res.url,
-                    headers: Object.fromEntries(res.headers.entries()),
-                    body: text,
-                    summary
+                const parsed = JSON.parse(text);
+                summary = {{
+                    sessionId: parsed?.responseMetadata?.sessionId || null,
+                    solutionSet: parsed?.responseMetadata?.solutionSet || null,
+                    sliceCount: parsed?.responseMetadata?.sliceCount || null,
+                    products: parsed?.products || null,
                 }};
-            }} catch (e) {{
-                return {{ error: String(e) }};
-            }}
-        }}
-        """
+            }} catch {{}}
 
+            return {{
+                status: res.status,
+                statusText: res.statusText,
+                url: res.url,
+                headers: Object.fromEntries(res.headers.entries()),
+                body: text,
+                summary
+            }};
+        }} catch (e) {{
+            return {{ error: String(e) }};
+        }}
+    }}
+    """
+
+    with _request_lock:
         result = page.evaluate(js_code)
-        browser.close()
 
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected response payload returned by browser context.")
@@ -132,3 +131,21 @@ def fetch_itinerary(
         raise RuntimeError("Unable to parse AA API response body.") from exc
 
     return result
+
+
+def fetch_itinerary(
+    origin: str,
+    destination: str,
+    date: str,
+    passengers: int,
+    award_search: bool,
+) -> Dict[str, Any]:
+    """Maintained for backwards compatibility; delegates to get_itinerary."""
+
+    return get_itinerary(
+        origin=origin,
+        destination=destination,
+        date=date,
+        passengers=passengers,
+        award_search=award_search,
+    )

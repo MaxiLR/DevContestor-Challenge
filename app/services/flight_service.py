@@ -3,7 +3,7 @@ import json
 from typing import Any, Dict, List
 
 from app.core.constants import AVAILABLE_CROSS_REFERENCES
-from app.services.aa_client import fetch_itinerary
+from app.services.aa_client import get_itinerary
 
 
 def get_time(datetime_str: str) -> str:
@@ -35,14 +35,14 @@ def _match_flights(
     date: str,
     passengers: int,
 ) -> List[Dict[str, Any]]:
-    points_response = fetch_itinerary(
+    points_response = get_itinerary(
         origin=origin,
         destination=destination,
         date=date,
         passengers=passengers,
         award_search=True,
     )
-    cash_response = fetch_itinerary(
+    cash_response = get_itinerary(
         origin=origin,
         destination=destination,
         date=date,
