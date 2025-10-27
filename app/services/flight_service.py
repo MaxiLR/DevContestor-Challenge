@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 from typing import Any, Dict, List
@@ -29,25 +30,27 @@ def calculate_cpp(cash_price: float, taxes: float, points: int) -> float:
     return ((cash_price - taxes) / points) * 100
 
 
-def _match_flights(
+async def _match_flights(
     origin: str,
     destination: str,
     date: str,
     passengers: int,
 ) -> List[Dict[str, Any]]:
-    points_response = get_itinerary(
-        origin=origin,
-        destination=destination,
-        date=date,
-        passengers=passengers,
-        award_search=True,
-    )
-    cash_response = get_itinerary(
-        origin=origin,
-        destination=destination,
-        date=date,
-        passengers=passengers,
-        award_search=False,
+    points_response, cash_response = await asyncio.gather(
+        get_itinerary(
+            origin=origin,
+            destination=destination,
+            date=date,
+            passengers=passengers,
+            award_search=True,
+        ),
+        get_itinerary(
+            origin=origin,
+            destination=destination,
+            date=date,
+            passengers=passengers,
+            award_search=False,
+        ),
     )
 
     points_slices = points_response["body"].get("slices", [])
@@ -135,7 +138,7 @@ def _parse_flights(
     return parsed_flights
 
 
-def build_search_results(
+async def build_search_results(
     origin: str,
     destination: str,
     date: str,
@@ -149,7 +152,7 @@ def build_search_results(
     destination_code = destination.upper()
     cabin_normalized = cabin_class.lower()
 
-    flights = _match_flights(
+    flights = await _match_flights(
         origin=origin_code,
         destination=destination_code,
         date=date,

@@ -1,14 +1,13 @@
 import json
-from threading import Lock
 from typing import Any, Dict
 
 from app.core.constants import API_URL
-from app.services.browser_manager import ensure_browser_started, get_bootstrap_page
+from app.services.browser_manager import AA_BOOKING_URL, acquire_page, ensure_browser_started
 
-_request_lock = Lock()
+AA_ORIGIN = "https://www.aa.com"
 
 
-def get_itinerary(
+async def get_itinerary(
     origin: str,
     destination: str,
     date: str,
@@ -17,59 +16,56 @@ def get_itinerary(
 ) -> Dict[str, Any]:
     """Invoke AA's itinerary search using the shared Playwright browser."""
 
-    ensure_browser_started()
-    page = get_bootstrap_page()
+    await ensure_browser_started()
 
-    payload = json.dumps(
-        {
-            "metadata": {
-                "selectedProducts": [],
-                "tripType": "OneWay",
-                "udo": {"search_method": "Lowest"},
-            },
-            "passengers": [{"type": "adult", "count": passengers}],
-            "requestHeader": {"clientId": "AAcom"},
-            "slices": [
-                {
-                    "allCarriers": True,
-                    "cabin": "",
-                    "departureDate": date,
-                    "destination": destination,
-                    "destinationNearbyAirports": False,
-                    "maxStops": None,
-                    "origin": origin,
-                    "originNearbyAirports": False,
-                }
-            ],
-            "tripOptions": {
-                "corporateBooking": False,
-                "fareType": "Lowest",
-                "locale": "en_US",
-                "pointOfSale": None,
-                "searchType": "Award" if award_search else "Revenue",
-            },
-            "loyaltyInfo": None,
-            "version": "cfr",
-            "queryParams": {
-                "sliceIndex": 0,
-                "sessionId": "",
-                "solutionSet": "",
-                "solutionId": "",
-                "sort": "CARRIER",
-            },
-        }
-    )
+    payload = {
+        "metadata": {
+            "selectedProducts": [],
+            "tripType": "OneWay",
+            "udo": {"search_method": "Lowest"},
+        },
+        "passengers": [{"type": "adult", "count": passengers}],
+        "requestHeader": {"clientId": "AAcom"},
+        "slices": [
+            {
+                "allCarriers": True,
+                "cabin": "",
+                "departureDate": date,
+                "destination": destination,
+                "destinationNearbyAirports": False,
+                "maxStops": None,
+                "origin": origin,
+                "originNearbyAirports": False,
+            }
+        ],
+        "tripOptions": {
+            "corporateBooking": False,
+            "fareType": "Lowest",
+            "locale": "en_US",
+            "pointOfSale": None,
+            "searchType": "Award" if award_search else "Revenue",
+        },
+        "loyaltyInfo": None,
+        "version": "cfr",
+        "queryParams": {
+            "sliceIndex": 0,
+            "sessionId": "",
+            "solutionSet": "",
+            "solutionId": "",
+            "sort": "CARRIER",
+        },
+    }
 
     js_code = f"""
-    async () => {{
-        const apiUrl = "{API_URL}";
-        const body = {payload};
+    async (args) => {{
+        const apiUrl = args.apiUrl;
+        const body = args.payload;
 
         const headers = {{
             'accept': 'application/json, text/plain, */*',
             'content-type': 'application/json',
-            'origin': location.origin,
-            'referer': location.href
+            'origin': '{AA_ORIGIN}',
+            'referer': '{AA_BOOKING_URL}'
         }};
 
         try {{
@@ -100,14 +96,17 @@ def get_itinerary(
                 body: text,
                 summary
             }};
-        }} catch (e) {{
-            return {{ error: String(e) }};
+        }} catch (error) {{
+            return {{ error: String(error) }};
         }}
     }}
     """
 
-    with _request_lock:
-        result = page.evaluate(js_code)
+    async with acquire_page() as page:
+        result = await page.evaluate(
+            js_code,
+            {"apiUrl": API_URL, "payload": payload},
+        )
 
     if not isinstance(result, dict):
         raise RuntimeError("Unexpected response payload returned by browser context.")
@@ -126,14 +125,15 @@ def get_itinerary(
         raise RuntimeError("AA API returned an empty body.")
 
     try:
-        result["body"] = json.loads(body_text)
+        parsed_body = json.loads(body_text)
+        result["body"] = parsed_body
     except json.JSONDecodeError as exc:
         raise RuntimeError("Unable to parse AA API response body.") from exc
 
     return result
 
 
-def fetch_itinerary(
+async def fetch_itinerary(
     origin: str,
     destination: str,
     date: str,
@@ -142,7 +142,7 @@ def fetch_itinerary(
 ) -> Dict[str, Any]:
     """Maintained for backwards compatibility; delegates to get_itinerary."""
 
-    return get_itinerary(
+    return await get_itinerary(
         origin=origin,
         destination=destination,
         date=date,

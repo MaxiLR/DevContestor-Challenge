@@ -12,7 +12,7 @@ def health() -> HealthResponse:
 
 
 @router.get("/flights", response_model=FlightsResponse)
-def flights_endpoint(
+async def flights_endpoint(
     origin: str = Query(..., min_length=3, max_length=3, description="Origin airport IATA code."),
     destination: str = Query(..., min_length=3, max_length=3, description="Destination airport IATA code."),
     date: str = Query(
@@ -27,7 +27,7 @@ def flights_endpoint(
     ),
 ) -> FlightsResponse:
     try:
-        payload = build_search_results(
+        payload = await build_search_results(
             origin=origin,
             destination=destination,
             date=date,
