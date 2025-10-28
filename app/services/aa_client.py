@@ -1,24 +1,198 @@
+import asyncio
 import json
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, List, Optional
+
+import httpx
 
 from app.core.constants import API_URL
-from app.services.browser_manager import AA_BOOKING_URL, acquire_page, ensure_browser_started
+from app.services import browser_manager
+from app.services.cookie_manager import get_cookies, refresh_cookies
 
 AA_ORIGIN = "https://www.aa.com"
+AA_REFERER = "https://www.aa.com/booking/choose-flights/1"
+_REFRESH_STATUS_CODES = {401, 403, 419, 429}
+
+_client_lock = asyncio.Lock()
+_client: Optional[httpx.AsyncClient] = None
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def get_itinerary(
+def _build_cookie_jar(cookies: List[Dict[str, Any]]) -> httpx.Cookies:
+    jar = httpx.Cookies()
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+
+        domain = cookie.get("domain")
+        path = cookie.get("path") or "/"
+        jar.set(name, str(value), domain=domain, path=path)
+
+    return jar
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _client
+
+    if _client is None:
+        async with _client_lock:
+            if _client is None:
+                _client = httpx.AsyncClient(http2=True, timeout=httpx.Timeout(30.0))
+
+    return _client
+
+
+async def shutdown_http_client() -> None:
+    global _client
+
+    async with _client_lock:
+        if _client is not None:
+            await _client.aclose()
+            _client = None
+
+
+async def _perform_request(
+    payload: Dict[str, Any],
+    cookies_bundle: Dict[str, Any],
+) -> httpx.Response:
+    client = await _get_http_client()
+
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "origin": AA_ORIGIN,
+        "referer": AA_REFERER,
+    }
+
+    user_agent = cookies_bundle.get("user_agent")
+    if isinstance(user_agent, str):
+        headers["user-agent"] = user_agent
+
+    accept_language = cookies_bundle.get("language")
+    languages = cookies_bundle.get("languages")
+    if isinstance(accept_language, str):
+        headers["accept-language"] = accept_language
+    if isinstance(languages, list) and languages:
+        headers.setdefault("accept-language", ",".join(languages))
+
+    # Emulate common fetch metadata headers
+    headers.setdefault("sec-fetch-site", "same-origin")
+    headers.setdefault("sec-fetch-mode", "cors")
+    headers.setdefault("sec-fetch-dest", "empty")
+
+    cookies = cookies_bundle.get("cookies") or []
+    jar = _build_cookie_jar(cookies)
+
+    response = await client.post(
+        API_URL,
+        json=payload,
+        headers=headers,
+        cookies=jar,
+    )
+    return response
+
+
+_PLAYWRIGHT_FETCH_SNIPPET = f"""
+async (args) => {{
+    const apiUrl = args.apiUrl;
+    const body = args.payload;
+
+    const headers = {{
+        'accept': 'application/json, text/plain, */*',
+        'content-type': 'application/json',
+        'origin': '{AA_ORIGIN}',
+        'referer': '{AA_REFERER}',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty'
+    }};
+
+    try {{
+        const res = await fetch(apiUrl, {{
+            method: 'POST',
+            credentials: 'include',
+            headers,
+            body: JSON.stringify(body),
+        }});
+        const text = await res.text();
+
+        let summary = null;
+        try {{
+            const parsed = JSON.parse(text);
+            summary = {{
+                sessionId: parsed?.responseMetadata?.sessionId || null,
+                solutionSet: parsed?.responseMetadata?.solutionSet || null,
+                sliceCount: parsed?.responseMetadata?.sliceCount || null,
+                products: parsed?.products || null,
+            }};
+        }} catch {{}}
+
+        return {{
+            status: res.status,
+            statusText: res.statusText,
+            url: res.url,
+            headers: Object.fromEntries(res.headers.entries()),
+            body: text,
+            summary
+        }};
+    }} catch (error) {{
+        return {{ error: String(error) }};
+    }}
+}}
+"""
+
+
+async def _perform_playwright_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    await browser_manager.ensure_browser_started()
+    context = browser_manager.get_browser_context()
+
+    page = await context.new_page()
+    try:
+        await page.goto(AA_REFERER)
+        await page.wait_for_selector("h1")
+        result = await page.evaluate(
+            _PLAYWRIGHT_FETCH_SNIPPET,
+            {"apiUrl": API_URL, "payload": payload},
+        )
+    finally:
+        await page.close()
+
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response payload returned by browser context.")
+
+    if "error" in result:
+        raise RuntimeError(result["error"])
+
+    status = result.get("status")
+    if isinstance(status, int) and status >= 400:
+        raise RuntimeError(
+            f'AA API responded with HTTP {status}: {result.get("body", "")}'
+        )
+
+    body_text = result.get("body")
+    if not body_text:
+        raise RuntimeError("AA API returned an empty body.")
+
+    try:
+        parsed_body = json.loads(body_text)
+        result["body"] = parsed_body
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Unable to parse AA API response body.") from exc
+
+    return result
+
+
+def _build_payload(
     origin: str,
     destination: str,
     date: str,
     passengers: int,
     award_search: bool,
 ) -> Dict[str, Any]:
-    """Invoke AA's itinerary search using the shared Playwright browser."""
-
-    await ensure_browser_started()
-
-    payload = {
+    return {
         "metadata": {
             "selectedProducts": [],
             "tripType": "OneWay",
@@ -56,81 +230,71 @@ async def get_itinerary(
         },
     }
 
-    js_code = f"""
-    async (args) => {{
-        const apiUrl = args.apiUrl;
-        const body = args.payload;
 
-        const headers = {{
-            'accept': 'application/json, text/plain, */*',
-            'content-type': 'application/json',
-            'origin': '{AA_ORIGIN}',
-            'referer': '{AA_BOOKING_URL}'
-        }};
+async def get_itinerary(
+    origin: str,
+    destination: str,
+    date: str,
+    passengers: int,
+    award_search: bool,
+) -> Dict[str, Any]:
+    """Invoke AA's itinerary search via httpx using shared session cookies."""
 
-        try {{
-            const res = await fetch(apiUrl, {{
-                method: 'POST',
-                credentials: 'include',
-                headers,
-                body: JSON.stringify(body),
-            }});
-            const text = await res.text();
+    payload = _build_payload(
+        origin=origin,
+        destination=destination,
+        date=date,
+        passengers=passengers,
+        award_search=award_search,
+    )
 
-            let summary = null;
-            try {{
-                const parsed = JSON.parse(text);
-                summary = {{
-                    sessionId: parsed?.responseMetadata?.sessionId || null,
-                    solutionSet: parsed?.responseMetadata?.solutionSet || null,
-                    sliceCount: parsed?.responseMetadata?.sliceCount || null,
-                    products: parsed?.products || null,
-                }};
-            }} catch {{}}
+    cookies_bundle = await get_cookies()
 
-            return {{
-                status: res.status,
-                statusText: res.statusText,
-                url: res.url,
-                headers: Object.fromEntries(res.headers.entries()),
-                body: text,
-                summary
-            }};
-        }} catch (error) {{
-            return {{ error: String(error) }};
-        }}
-    }}
-    """
+    for attempt in range(2):
+        response = await _perform_request(payload, cookies_bundle)
 
-    async with acquire_page() as page:
-        result = await page.evaluate(
-            js_code,
-            {"apiUrl": API_URL, "payload": payload},
-        )
+        if response.status_code in _REFRESH_STATUS_CODES:
+            cookies_bundle = await refresh_cookies()
+            continue
 
-    if not isinstance(result, dict):
-        raise RuntimeError("Unexpected response payload returned by browser context.")
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"AA API responded with HTTP {response.status_code}: {response.text}"
+            )
 
-    if "error" in result:
-        raise RuntimeError(result["error"])
+        body_text = response.text
+        if not body_text:
+            raise RuntimeError("AA API returned an empty body.")
 
-    status = result.get("status")
-    if isinstance(status, int) and status >= 400:
-        raise RuntimeError(
-            f'AA API responded with HTTP {status}: {result.get("body", "")}'
-        )
+        try:
+            parsed_body = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Unable to parse AA API response body.") from exc
 
-    body_text = result.get("body")
-    if not body_text:
-        raise RuntimeError("AA API returned an empty body.")
+        summary = {
+            "sessionId": parsed_body.get("responseMetadata", {}).get("sessionId"),
+            "solutionSet": parsed_body.get("responseMetadata", {}).get("solutionSet"),
+            "sliceCount": parsed_body.get("responseMetadata", {}).get("sliceCount"),
+            "products": parsed_body.get("products"),
+        }
 
-    try:
-        parsed_body = json.loads(body_text)
-        result["body"] = parsed_body
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Unable to parse AA API response body.") from exc
+        return {
+            "status": response.status_code,
+            "statusText": response.reason_phrase,
+            "url": str(response.url),
+            "headers": dict(response.headers.items()),
+            "body": parsed_body,
+            "summary": summary,
+        }
 
-    return result
+    # httpx attempts failed due to repeated auth/rate issues; fall back to browser fetch.
+    fallback_result = await _perform_playwright_fetch(payload)
+
+    # After a successful browser fetch, refresh stored cookies so subsequent calls
+    # can reuse the newly authenticated session.
+    await refresh_cookies()
+
+    return fallback_result
 
 
 async def fetch_itinerary(

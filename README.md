@@ -32,11 +32,12 @@ American Airlines hides the side-by-side comparison that would show whether cash
 ```
 
 ## Approach and Implementation
-1. A Playwright session loads AA's booking page headlessly, then executes the itinerary `fetch` from inside the browser context with `credentials: include` so AA treats it like a real customer session (light bot evasion).
-2. Two POSTs are issued per search: one for award pricing (`searchType="Award"`) and one for cash pricing (`searchType="Revenue"`).
-3. Flights are intersected via the shared `hash` field. Each surviving flight pulls departure/arrival timestamps, the relevant cabin product groups, and the per-passenger prices.
-4. CPP is computed as `(cash_price_usd - taxes_fees_usd) / points_required × 100`, rounded to two decimals. Responses that lack the needed pricing blocks are skipped.
-5. FastAPI exposes `/flights` for the comparison and `/health` for readiness checks. Errors from AA's API propagate as `502` responses, while validation issues (e.g., unsupported cabin class) surface as `400`s.
+1. A Playwright Firefox context warms AA's booking page to harvest real session cookies, user-agent, and locale hints. A shared cookie manager guards refreshes so only one request hits the browser when the session expires.
+2. The API issues two async POSTs per search (award + cash) using `httpx` over HTTP/2, reusing the harvested cookies for speed. If AA replies with auth/rate errors, the cookies are refreshed and retried automatically.
+3. When AA keeps rejecting the `httpx` call, the service falls back to firing the same request through Playwright’s in-browser `fetch`, preserving the bot-evasion behavior and seeding a fresh cookie jar for subsequent traffic.
+4. Flights are intersected via the shared `hash` field. Each surviving flight pulls departure/arrival timestamps, the relevant cabin product groups, and the per-passenger prices.
+5. CPP is computed as `(cash_price_usd - taxes_fees_usd) / points_required × 100`, rounded to two decimals. Responses that lack the needed pricing blocks are skipped.
+6. FastAPI exposes `/flights` for the comparison and `/health` for readiness checks. Errors from AA's API propagate as `502` responses, while validation issues (e.g., unsupported cabin class) surface as `400`s.
 
 ## Running Locally
 1. Install dependencies and browsers:
@@ -44,7 +45,7 @@ American Airlines hides the side-by-side comparison that would show whether cash
    uv sync
    uv run playwright install firefox
    ```
-2. Start the API server:
+2. Start the API server (this bootstraps the browser, hydrates cookies, and opens the HTTP/2 client):
    ```bash
    uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
    ```
@@ -100,5 +101,5 @@ docker run --rm -p 8000:8000 point-break
 > The example illustrates the required response shape; live numbers depend on real-time AA availability.
 
 ## Additional Notes
-- The bot evasion strategy relies on Playwright maintaining real browser fingerprints and cookies. For higher resilience you can rotate user agents, add random delays, or proxy requests, though AA's current flows already accept this approach.
+- The bot evasion strategy now runs in two layers: `httpx` handles the fast path with real browser cookies, while Playwright executes the fallback call whenever AA blocks the synthetic fingerprint. You can adjust the refresh cadence or extend the captured headers inside `browser_manager` if AA tightens detection.
 - Extend the `AVAILABLE_CROSS_REFERENCES` list to support more cabins once AA exposes consistent identifiers for them across award and cash searches.
