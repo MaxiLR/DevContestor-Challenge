@@ -55,47 +55,6 @@ async def shutdown_http_client() -> None:
             _client = None
 
 
-async def _perform_request(
-    payload: Dict[str, Any],
-    cookies_bundle: Dict[str, Any],
-) -> httpx.Response:
-    client = await _get_http_client()
-
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "content-type": "application/json",
-        "origin": AA_ORIGIN,
-        "referer": AA_REFERER,
-    }
-
-    user_agent = cookies_bundle.get("user_agent")
-    if isinstance(user_agent, str):
-        headers["user-agent"] = user_agent
-
-    accept_language = cookies_bundle.get("language")
-    languages = cookies_bundle.get("languages")
-    if isinstance(accept_language, str):
-        headers["accept-language"] = accept_language
-    if isinstance(languages, list) and languages:
-        headers.setdefault("accept-language", ",".join(languages))
-
-    # Emulate common fetch metadata headers
-    headers.setdefault("sec-fetch-site", "same-origin")
-    headers.setdefault("sec-fetch-mode", "cors")
-    headers.setdefault("sec-fetch-dest", "empty")
-
-    cookies = cookies_bundle.get("cookies") or []
-    jar = _build_cookie_jar(cookies)
-
-    response = await client.post(
-        API_URL,
-        json=payload,
-        headers=headers,
-        cookies=jar,
-    )
-    return response
-
-
 _PLAYWRIGHT_FETCH_SNIPPET = f"""
 async (args) => {{
     const apiUrl = args.apiUrl;
@@ -146,6 +105,46 @@ async (args) => {{
 """
 
 
+async def _perform_request(
+    payload: Dict[str, Any],
+    cookies_bundle: Dict[str, Any],
+) -> httpx.Response:
+    client = await _get_http_client()
+
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json",
+        "origin": AA_ORIGIN,
+        "referer": AA_REFERER,
+    }
+
+    user_agent = cookies_bundle.get("user_agent")
+    if isinstance(user_agent, str):
+        headers["user-agent"] = user_agent
+
+    accept_language = cookies_bundle.get("language")
+    languages = cookies_bundle.get("languages")
+    if isinstance(accept_language, str):
+        headers["accept-language"] = accept_language
+    if isinstance(languages, list) and languages:
+        headers.setdefault("accept-language", ",".join(languages))
+
+    headers.setdefault("sec-fetch-site", "same-origin")
+    headers.setdefault("sec-fetch-mode", "cors")
+    headers.setdefault("sec-fetch-dest", "empty")
+
+    cookies = cookies_bundle.get("cookies") or []
+    jar = _build_cookie_jar(cookies)
+
+    response = await client.post(
+        API_URL,
+        json=payload,
+        headers=headers,
+        cookies=jar,
+    )
+    return response
+
+
 async def _perform_playwright_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
     await browser_manager.ensure_browser_started()
 
@@ -175,7 +174,9 @@ async def _perform_playwright_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
                     pass
 
         if not isinstance(result, dict):
-            raise RuntimeError("Unexpected response payload returned by browser context.")
+            raise RuntimeError(
+                "Unexpected response payload returned by browser context."
+            )
 
         if "error" in result:
             raise RuntimeError(result["error"])
@@ -198,7 +199,9 @@ async def _perform_playwright_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         return result
 
-    raise RuntimeError("Unable to execute fallback fetch after multiple attempts") from last_exception
+    raise RuntimeError(
+        "Unable to execute fallback fetch after multiple attempts"
+    ) from last_exception
 
 
 def _build_payload(
@@ -221,10 +224,10 @@ def _build_payload(
                 "allCarriers": True,
                 "cabin": "",
                 "departureDate": date,
-                "destination": destination,
+                "destination": destination.upper(),
                 "destinationNearbyAirports": False,
                 "maxStops": None,
-                "origin": origin,
+                "origin": origin.upper(),
                 "originNearbyAirports": False,
             }
         ],
@@ -254,7 +257,7 @@ async def get_itinerary(
     passengers: int,
     award_search: bool,
 ) -> Dict[str, Any]:
-    """Invoke AA's itinerary search via httpx using shared session cookies."""
+    """Invoke AA's itinerary search using httpx, falling back to Playwright when needed."""
 
     payload = _build_payload(
         origin=origin,
@@ -266,7 +269,7 @@ async def get_itinerary(
 
     cookies_bundle = await get_cookies()
 
-    for attempt in range(2):
+    for _ in range(2):
         response = await _perform_request(payload, cookies_bundle)
 
         if response.status_code in _REFRESH_STATUS_CODES:
@@ -303,11 +306,9 @@ async def get_itinerary(
             "summary": summary,
         }
 
-    # httpx attempts failed due to repeated auth/rate issues; fall back to browser fetch.
     fallback_result = await _perform_playwright_fetch(payload)
 
-    # After a successful browser fetch, refresh stored cookies so subsequent calls
-    # can reuse the newly authenticated session.
+    # After a successful browser fetch, refresh stored cookies
     await refresh_cookies()
 
     return fallback_result

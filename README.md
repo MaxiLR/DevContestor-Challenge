@@ -33,8 +33,8 @@ American Airlines hides the side-by-side comparison that would show whether cash
 
 ## Approach and Implementation
 1. A Playwright Firefox context warms AA's booking page to harvest real session cookies, user-agent, and locale hints. A shared cookie manager guards refreshes so only one request hits the browser when the session expires.
-2. The API issues two async POSTs per search (award + cash) using `httpx` over HTTP/2, reusing the harvested cookies for speed. If AA replies with auth/rate errors, the cookies are refreshed and retried automatically.
-3. When AA keeps rejecting the `httpx` call, the service falls back to firing the same request through Playwright’s in-browser `fetch`, preserving the bot-evasion behavior and seeding a fresh cookie jar for subsequent traffic.
+2. Each itinerary search (award + cash) is executed with `httpx` over HTTP/2 using the warmed browser cookies for speed.
+3. When AA rejects the synthetic client (auth/rate issues), the same request is retried through Playwright’s in-browser `fetch`, which also refreshes the cookie jar for subsequent calls.
 4. Flights are intersected via the shared `hash` field. Each surviving flight pulls departure/arrival timestamps, the relevant cabin product groups, and the per-passenger prices.
 5. CPP is computed as `(cash_price_usd - taxes_fees_usd) / points_required × 100`, rounded to two decimals. Responses that lack the needed pricing blocks are skipped.
 6. FastAPI exposes `/flights` for the comparison and `/health` for readiness checks. Errors from AA's API propagate as `502` responses, while validation issues (e.g., unsupported cabin class) surface as `400`s.
@@ -45,7 +45,7 @@ American Airlines hides the side-by-side comparison that would show whether cash
    uv sync
    uv run playwright install firefox
    ```
-2. Start the API server (this bootstraps the browser, hydrates cookies, and opens the HTTP/2 client):
+2. Start the API server (this bootstraps the browser and hydrates cookies):
    ```bash
    uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
    ```
@@ -101,5 +101,5 @@ docker run --rm -p 8000:8000 point-break
 > The example illustrates the required response shape; live numbers depend on real-time AA availability.
 
 ## Additional Notes
-- The bot evasion strategy now runs in two layers: `httpx` handles the fast path with real browser cookies, while Playwright executes the fallback call whenever AA blocks the synthetic fingerprint. You can adjust the refresh cadence or extend the captured headers inside `browser_manager` if AA tightens detection.
+- The fast path uses `httpx`; Playwright only takes over after repeated authentication failures. Tweak the headers captured in `browser_manager` if AA tightens detection.
 - Extend the `AVAILABLE_CROSS_REFERENCES` list to support more cabins once AA exposes consistent identifiers for them across award and cash searches.
