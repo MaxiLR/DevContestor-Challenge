@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
+from playwright._impl._errors import TargetClosedError
 
 from app.core.constants import API_URL
 from app.services import browser_manager
@@ -147,42 +148,57 @@ async (args) => {{
 
 async def _perform_playwright_fetch(payload: Dict[str, Any]) -> Dict[str, Any]:
     await browser_manager.ensure_browser_started()
-    context = browser_manager.get_browser_context()
 
-    page = await context.new_page()
-    try:
-        await page.goto(AA_REFERER)
-        await page.wait_for_selector("h1")
-        result = await page.evaluate(
-            _PLAYWRIGHT_FETCH_SNIPPET,
-            {"apiUrl": API_URL, "payload": payload},
-        )
-    finally:
-        await page.close()
+    last_exception: Optional[Exception] = None
 
-    if not isinstance(result, dict):
-        raise RuntimeError("Unexpected response payload returned by browser context.")
+    for _ in range(3):
+        context = browser_manager.get_browser_context()
+        page = None
 
-    if "error" in result:
-        raise RuntimeError(result["error"])
+        try:
+            page = await context.new_page()
+            await page.goto(AA_REFERER)
+            await page.wait_for_selector("h1")
+            result = await page.evaluate(
+                _PLAYWRIGHT_FETCH_SNIPPET,
+                {"apiUrl": API_URL, "payload": payload},
+            )
+        except TargetClosedError as exc:
+            last_exception = exc
+            await refresh_cookies()
+            continue
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except TargetClosedError:
+                    pass
 
-    status = result.get("status")
-    if isinstance(status, int) and status >= 400:
-        raise RuntimeError(
-            f'AA API responded with HTTP {status}: {result.get("body", "")}'
-        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected response payload returned by browser context.")
 
-    body_text = result.get("body")
-    if not body_text:
-        raise RuntimeError("AA API returned an empty body.")
+        if "error" in result:
+            raise RuntimeError(result["error"])
 
-    try:
-        parsed_body = json.loads(body_text)
-        result["body"] = parsed_body
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Unable to parse AA API response body.") from exc
+        status = result.get("status")
+        if isinstance(status, int) and status >= 400:
+            raise RuntimeError(
+                f'AA API responded with HTTP {status}: {result.get("body", "")}'
+            )
 
-    return result
+        body_text = result.get("body")
+        if not body_text:
+            raise RuntimeError("AA API returned an empty body.")
+
+        try:
+            parsed_body = json.loads(body_text)
+            result["body"] = parsed_body
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Unable to parse AA API response body.") from exc
+
+        return result
+
+    raise RuntimeError("Unable to execute fallback fetch after multiple attempts") from last_exception
 
 
 def _build_payload(
