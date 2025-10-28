@@ -1,23 +1,25 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api.routes import router
-from app.services.aa_client import shutdown_http_client
-from app.services.browser_manager import shutdown_browser, startup_browser
-from app.services.cookie_manager import refresh_cookies
+from app.services.browser_manager import (
+    refresh_browser_session,
+    shutdown_browser,
+    startup_browser,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await startup_browser()
-    await refresh_cookies()
+    await refresh_browser_session()
     try:
         yield
     finally:
-        await shutdown_http_client()
-        await shutdown_browser()
+        await asyncio.shield(shutdown_browser())
 
 
 def create_app() -> FastAPI:
