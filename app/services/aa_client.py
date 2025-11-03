@@ -2,7 +2,12 @@ import json
 from typing import Any, Dict
 
 from app.core.constants import API_URL
-from app.services.browser_manager import AA_BOOKING_URL, acquire_page, ensure_browser_started
+from app.services.browser_manager import (
+    AA_BOOKING_URL,
+    acquire_page,
+    ensure_browser_started,
+    register_successful_request,
+)
 
 AA_ORIGIN = "https://www.aa.com"
 
@@ -132,6 +137,8 @@ async def get_itinerary(
         result["body"] = parsed_body
     except json.JSONDecodeError as exc:
         raise RuntimeError("Unable to parse AA API response body.") from exc
+
+    await register_successful_request()
 
     return result
 

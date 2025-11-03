@@ -1,280 +1,381 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Literal, Optional
+from typing import AsyncIterator, Dict, Literal, Optional
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     Playwright,
-    async_playwright,
     TimeoutError,
+    async_playwright,
 )
 
 from app.core.exceptions import BrowserFingerprintBannedException
 
+logger = logging.getLogger(__name__)
 
 AA_HOMEPAGE_URL = "https://www.aa.com/"
 AA_BOOKING_URL = "https://www.aa.com/booking"  # Used for referer header in API requests
 AA_WARMUP_SELECTOR = '[id="flightSearchForm.button.reSubmit"]'
 AA_WARMUP_TIMEOUT = 10000  # 10 seconds
 _POOL_SIZE = 2
+_ROTATION_THRESHOLD = 75
 
 SearchType = Literal["Award", "Revenue"]
+PairKey = Literal["webkit", "firefox"]
 
-# Award browser globals
-_award_playwright_manager: Optional[object] = None
-_award_playwright: Optional[Playwright] = None
-_award_browser: Optional[Browser] = None
-_award_context: Optional[BrowserContext] = None
-_award_bootstrap_page: Optional[Page] = None
-_award_page_pool: Optional[asyncio.Queue[Page]] = None
 
-# Cash (Revenue) browser globals
-_cash_playwright_manager: Optional[object] = None
-_cash_playwright: Optional[Playwright] = None
-_cash_browser: Optional[Browser] = None
-_cash_context: Optional[BrowserContext] = None
-_cash_bootstrap_page: Optional[Page] = None
-_cash_page_pool: Optional[asyncio.Queue[Page]] = None
+@dataclass
+class BrowserPairState:
+    """Container holding browser resources for a specific engine pair."""
 
+    engine: PairKey
+    manager: Optional[object] = None
+    playwright: Optional[Playwright] = None
+    award_browser: Optional[Browser] = None
+    cash_browser: Optional[Browser] = None
+    award_context: Optional[BrowserContext] = None
+    cash_context: Optional[BrowserContext] = None
+    award_bootstrap_page: Optional[Page] = None
+    cash_bootstrap_page: Optional[Page] = None
+    award_page_pool: Optional[asyncio.Queue[Page]] = None
+    cash_page_pool: Optional[asyncio.Queue[Page]] = None
+    healthy: bool = False
+
+
+_browser_pairs: Dict[PairKey, BrowserPairState] = {
+    "webkit": BrowserPairState(engine="webkit"),
+    "firefox": BrowserPairState(engine="firefox"),
+}
+
+_active_pair: PairKey = "webkit"
+_request_counter = 0
 _startup_lock = asyncio.Lock()
+_request_counter_lock = asyncio.Lock()
 
 
-async def _create_warmed_page(search_type: SearchType) -> Page:
-    """Create a new warmed page for the specified search type (Award or Revenue)."""
+def _get_pair_state(pair_key: PairKey) -> BrowserPairState:
+    return _browser_pairs[pair_key]
 
-    if search_type == "Award":
-        context = _award_context
-    else:
-        context = _cash_context
 
+async def _teardown_pair(state: BrowserPairState) -> None:
+    """Release all Playwright resources for a browser pair."""
+
+    # Drain pools
+    for queue_attr in ("award_page_pool", "cash_page_pool"):
+        queue: Optional[asyncio.Queue[Page]] = getattr(state, queue_attr)
+        if queue:
+            setattr(state, queue_attr, None)
+            while True:
+                try:
+                    page = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not page.is_closed():
+                    await page.close()
+
+    # Close bootstrap pages
+    for page_attr in ("award_bootstrap_page", "cash_bootstrap_page"):
+        page = getattr(state, page_attr)
+        if page and not page.is_closed():
+            await page.close()
+        setattr(state, page_attr, None)
+
+    # Close contexts and browsers
+    for context_attr in ("award_context", "cash_context"):
+        context = getattr(state, context_attr)
+        if context:
+            await context.close()
+        setattr(state, context_attr, None)
+
+    for browser_attr in ("award_browser", "cash_browser"):
+        browser = getattr(state, browser_attr)
+        if browser:
+            await browser.close()
+        setattr(state, browser_attr, None)
+
+    # Stop Playwright manager
+    if state.manager:
+        try:
+            await state.manager.stop()
+        except RuntimeError:
+            logger.debug("Playwright manager stop skipped; manager was not started.")
+    state.manager = None
+    state.playwright = None
+    state.healthy = False
+
+
+def _get_launcher(state: BrowserPairState):
+    if not state.playwright:
+        raise RuntimeError("Playwright runtime is not initialized for this pair.")
+
+    if state.engine == "webkit":
+        return state.playwright.webkit
+    if state.engine == "firefox":
+        return state.playwright.firefox
+    raise RuntimeError(f"Unsupported browser engine '{state.engine}'.")
+
+
+async def _create_warmed_page(state: BrowserPairState, search_type: SearchType) -> Page:
+    """Create a warmed Playwright page for the selected browser pair and search type."""
+
+    context = state.award_context if search_type == "Award" else state.cash_context
     if not context:
-        raise RuntimeError(f"{search_type} browser context is not initialized.")
+        raise RuntimeError(f"{search_type} browser context is not initialized for {state.engine}.")
 
     page = await context.new_page()
-
     try:
         await page.goto(AA_HOMEPAGE_URL, wait_until="domcontentloaded")
         await page.wait_for_selector(AA_WARMUP_SELECTOR, timeout=AA_WARMUP_TIMEOUT)
-    except TimeoutError as e:
+    except TimeoutError as exc:
         await page.close()
         raise BrowserFingerprintBannedException(
-            f"Failed to load AA homepage selector '{AA_WARMUP_SELECTOR}' within {AA_WARMUP_TIMEOUT}ms. "
+            f"Failed to load AA homepage selector '{AA_WARMUP_SELECTOR}' within {AA_WARMUP_TIMEOUT}ms using {state.engine}. "
             "This likely indicates the current browser fingerprint was blocked; recycle the context, rotate fingerprints, or route through a different proxy."
-        ) from e
+        ) from exc
 
     return page
 
 
-async def _ensure_page_pool(search_type: SearchType) -> None:
-    """Ensure the page pool for the specified search type is initialized."""
+async def _ensure_page_pool(state: BrowserPairState, search_type: SearchType) -> None:
+    queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
+    bootstrap_attr = "award_bootstrap_page" if search_type == "Award" else "cash_bootstrap_page"
 
-    global _award_bootstrap_page, _award_page_pool, _cash_bootstrap_page, _cash_page_pool
+    queue: Optional[asyncio.Queue[Page]] = getattr(state, queue_attr)
+    if queue is not None:
+        return
 
-    if search_type == "Award":
-        if _award_page_pool is not None:
-            return
+    queue = asyncio.Queue()
+    bootstrap_page = await _create_warmed_page(state, search_type)
+    await queue.put(bootstrap_page)
+    setattr(state, bootstrap_attr, bootstrap_page)
 
-        queue: asyncio.Queue[Page] = asyncio.Queue()
-        bootstrap = await _create_warmed_page(search_type)
-        _award_bootstrap_page = bootstrap
-        await queue.put(bootstrap)
+    for _ in range(_POOL_SIZE - 1):
+        warmed = await _create_warmed_page(state, search_type)
+        await queue.put(warmed)
 
-        for _ in range(_POOL_SIZE - 1):
-            warmed = await _create_warmed_page(search_type)
-            await queue.put(warmed)
+    setattr(state, queue_attr, queue)
 
-        _award_page_pool = queue
-    else:
-        if _cash_page_pool is not None:
-            return
 
-        queue: asyncio.Queue[Page] = asyncio.Queue()
-        bootstrap = await _create_warmed_page(search_type)
-        _cash_bootstrap_page = bootstrap
-        await queue.put(bootstrap)
+async def _initialize_pair(pair_key: PairKey) -> None:
+    """Initialize and warm the specified browser pair."""
 
-        for _ in range(_POOL_SIZE - 1):
-            warmed = await _create_warmed_page(search_type)
-            await queue.put(warmed)
+    state = _get_pair_state(pair_key)
+    if state.healthy:
+        return
 
-        _cash_page_pool = queue
+    # Ensure any existing resources are closed before initializing.
+    await _teardown_pair(state)
+
+    try:
+        state.manager = async_playwright()
+        state.playwright = await state.manager.start()
+
+        launcher = _get_launcher(state)
+        state.award_browser = await launcher.launch(headless=True)
+        state.award_context = await state.award_browser.new_context()
+
+        state.cash_browser = await launcher.launch(headless=True)
+        state.cash_context = await state.cash_browser.new_context()
+
+        await asyncio.gather(
+            _ensure_page_pool(state, "Award"),
+            _ensure_page_pool(state, "Revenue"),
+        )
+        state.healthy = True
+        logger.info("Initialized %s browser pair.", pair_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to initialize %s browser pair: %s", pair_key, exc)
+        await _teardown_pair(state)
+        raise
 
 
 async def startup_browser() -> None:
-    """Start both Award and Cash WebKit browsers with warmed page pools."""
+    """Start both WebKit and Firefox browser pairs with warmed page pools."""
 
-    global _award_playwright_manager, _award_playwright, _award_browser, _award_context
-    global _cash_playwright_manager, _cash_playwright, _cash_browser, _cash_context
+    global _active_pair, _request_counter
 
     async with _startup_lock:
-        if _award_browser and _cash_browser:
-            return
+        successes = []
+        for pair_key in ("webkit", "firefox"):
+            try:
+                await _initialize_pair(pair_key)  # Will no-op if already healthy
+            except Exception:  # noqa: BLE001
+                continue
+            if _get_pair_state(pair_key).healthy:
+                successes.append(pair_key)
 
-        # Initialize Award browser
-        _award_playwright_manager = async_playwright()
-        _award_playwright = await _award_playwright_manager.start()
-        _award_browser = await _award_playwright.webkit.launch(headless=True)
-        _award_context = await _award_browser.new_context()
+        if not successes:
+            raise RuntimeError("Failed to initialize any browser pair during startup.")
 
-        # Initialize Cash browser
-        _cash_playwright_manager = async_playwright()
-        _cash_playwright = await _cash_playwright_manager.start()
-        _cash_browser = await _cash_playwright.webkit.launch(headless=True)
-        _cash_context = await _cash_browser.new_context()
+        # Prefer WebKit if healthy; otherwise fall back to first successful pair.
+        if _get_pair_state("webkit").healthy:
+            _active_pair = "webkit"
+        else:
+            _active_pair = successes[0]
+            logger.warning(
+                "WebKit pair unavailable at startup; using %s as active pair.",
+                _active_pair,
+            )
 
-        # Warm up both page pools concurrently
-        await asyncio.gather(
-            _ensure_page_pool("Award"),
-            _ensure_page_pool("Revenue"),
+        _request_counter = 0
+        logger.info(
+            "Browser startup complete. Active pair=%s, healthy_pairs=%s",
+            _active_pair,
+            successes,
         )
 
 
 async def shutdown_browser() -> None:
-    """Close both Award and Cash browser resources."""
-
-    global _award_playwright_manager, _award_playwright, _award_browser, _award_context
-    global _award_bootstrap_page, _award_page_pool
-    global _cash_playwright_manager, _cash_playwright, _cash_browser, _cash_context
-    global _cash_bootstrap_page, _cash_page_pool
+    """Close all browser pair resources."""
 
     async with _startup_lock:
-        # Clean up Award browser
-        if _award_page_pool:
-            queue = _award_page_pool
-            _award_page_pool = None
-            while True:
-                try:
-                    page = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if not page.is_closed():
-                    await page.close()
+        for pair_key in ("webkit", "firefox"):
+            state = _get_pair_state(pair_key)
+            if state.manager or state.healthy:
+                await _teardown_pair(state)
+        logger.info("All browser pairs shut down.")
 
-        if _award_bootstrap_page and not _award_bootstrap_page.is_closed():
-            await _award_bootstrap_page.close()
-        _award_bootstrap_page = None
 
-        if _award_context:
-            await _award_context.close()
-            _award_context = None
+async def ensure_browser_started() -> None:
+    """Ensure at least one browser pair is available and active."""
 
-        if _award_browser:
-            await _award_browser.close()
-            _award_browser = None
+    async with _startup_lock:
+        active_state = _get_pair_state(_active_pair)
+        if active_state.healthy:
+            return
 
-        if _award_playwright_manager:
-            await _award_playwright_manager.stop()
-            _award_playwright_manager = None
-            _award_playwright = None
+        # Try to reinitialize the active pair first.
+        try:
+            await _initialize_pair(_active_pair)
+        except Exception:  # noqa: BLE001
+            pass
 
-        # Clean up Cash browser
-        if _cash_page_pool:
-            queue = _cash_page_pool
-            _cash_page_pool = None
-            while True:
-                try:
-                    page = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if not page.is_closed():
-                    await page.close()
+        if _get_pair_state(_active_pair).healthy:
+            return
 
-        if _cash_bootstrap_page and not _cash_bootstrap_page.is_closed():
-            await _cash_bootstrap_page.close()
-        _cash_bootstrap_page = None
+        # Fall back to the alternate pair.
+        alternate = "firefox" if _active_pair == "webkit" else "webkit"
+        try:
+            await _initialize_pair(alternate)
+        except Exception:  # noqa: BLE001
+            pass
 
-        if _cash_context:
-            await _cash_context.close()
-            _cash_context = None
+        if not _get_pair_state(alternate).healthy:
+            raise RuntimeError("Unable to initialize any browser pair.")
 
-        if _cash_browser:
-            await _cash_browser.close()
-            _cash_browser = None
+        _switch_active_pair(alternate)
 
-        if _cash_playwright_manager:
-            await _cash_playwright_manager.stop()
-            _cash_playwright_manager = None
-            _cash_playwright = None
+
+def _switch_active_pair(pair_key: PairKey) -> None:
+    global _active_pair
+    _active_pair = pair_key
+    logger.info("Active browser pair switched to %s.", pair_key)
+
+
+async def _rotate_active_pair() -> None:
+    """Alternate between WebKit and Firefox pairs after threshold is met."""
+
+    target: PairKey = "firefox" if _active_pair == "webkit" else "webkit"
+
+    async with _startup_lock:
+        state = _get_pair_state(target)
+        if not state.healthy:
+            try:
+                await _initialize_pair(target)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Rotation skipped. Unable to activate %s pair: %s",
+                    target,
+                    exc,
+                )
+                return
+
+        _switch_active_pair(target)
+
+
+async def _record_successful_request() -> None:
+    """Track successful itinerary requests and rotate pairs when threshold is reached."""
+
+    rotate = False
+    async with _request_counter_lock:
+        global _request_counter
+        _request_counter += 1
+        if _request_counter >= _ROTATION_THRESHOLD:
+            _request_counter = 0
+            rotate = True
+
+    if rotate:
+        await _rotate_active_pair()
 
 
 async def get_bootstrap_page(search_type: SearchType = "Award") -> Page:
-    """Get the bootstrap page for the specified search type."""
-
-    global _award_bootstrap_page, _cash_bootstrap_page
+    """Get the bootstrap page for the specified search type from the active pair."""
 
     await ensure_browser_started()
 
     async with _startup_lock:
-        if search_type == "Award":
-            page = _award_bootstrap_page
-            if not page or page.is_closed():
-                page = await _create_warmed_page(search_type)
-                _award_bootstrap_page = page
-                if _award_page_pool:
-                    await _award_page_pool.put(page)
-            return page
-        else:
-            page = _cash_bootstrap_page
-            if not page or page.is_closed():
-                page = await _create_warmed_page(search_type)
-                _cash_bootstrap_page = page
-                if _cash_page_pool:
-                    await _cash_page_pool.put(page)
-            return page
+        state = _get_pair_state(_active_pair)
+        page_attr = "award_bootstrap_page" if search_type == "Award" else "cash_bootstrap_page"
+        page = getattr(state, page_attr)
+
+        if not page or page.is_closed():
+            page = await _create_warmed_page(state, search_type)
+            setattr(state, page_attr, page)
+            queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
+            queue = getattr(state, queue_attr)
+            if queue:
+                await queue.put(page)
+
+        return page
 
 
 def get_browser(search_type: SearchType = "Award") -> Browser:
-    """Get the browser instance for the specified search type."""
+    """Get the browser instance for the specified search type from the active pair."""
 
-    if search_type == "Award":
-        if not _award_browser:
-            raise RuntimeError("Award browser is not initialized.")
-        return _award_browser
-    else:
-        if not _cash_browser:
-            raise RuntimeError("Cash browser is not initialized.")
-        return _cash_browser
-
-
-async def ensure_browser_started() -> None:
-    """Ensure both browsers are started."""
-
-    if (
-        not _award_browser
-        or not _award_context
-        or not _cash_browser
-        or not _cash_context
-    ):
-        await startup_browser()
+    state = _get_pair_state(_active_pair)
+    browser = state.award_browser if search_type == "Award" else state.cash_browser
+    if not browser:
+        raise RuntimeError(f"{search_type} browser is not initialized for active pair {_active_pair}.")
+    return browser
 
 
 @asynccontextmanager
 async def acquire_page(search_type: SearchType) -> AsyncIterator[Page]:
-    """Acquire a page from the pool for the specified search type (Award or Revenue)."""
+    """Acquire a page from the active pair pool for the specified search type."""
 
     await ensure_browser_started()
 
     async with _startup_lock:
-        queue = _award_page_pool if search_type == "Award" else _cash_page_pool
+        pair_key = _active_pair
+        state = _get_pair_state(pair_key)
+        queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
+        queue = getattr(state, queue_attr)
 
-    if not queue:
-        raise RuntimeError(f"{search_type} page pool is not initialized.")
+        if queue is None:
+            raise RuntimeError(f"{search_type} page pool is not initialized for {pair_key}.")
 
     page = await queue.get()
     try:
-        # Only recreate the page if it's closed - no need to re-navigate
         if page.is_closed():
-            page = await _create_warmed_page(search_type)
-
+            async with _startup_lock:
+                state = _get_pair_state(pair_key)
+            page = await _create_warmed_page(state, search_type)
         yield page
     finally:
-        # Return the page to the pool for reuse if still available.
         async with _startup_lock:
-            queue = _award_page_pool if search_type == "Award" else _cash_page_pool
-
+            state = _get_pair_state(pair_key)
+            queue = getattr(state, queue_attr)
         if queue and not page.is_closed():
             await queue.put(page)
+
+
+async def register_successful_request() -> None:
+    """Public hook to record successful itinerary fetches."""
+
+    await _record_successful_request()
