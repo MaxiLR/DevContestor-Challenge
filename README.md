@@ -71,7 +71,7 @@ docker run --rm -p 8000:8000 point-break
     "destination": "JFK",
     "date": "2025-12-15",
     "passengers": 1,
-    "cabin_class": "economy"
+    "cabin_class": "main"
   },
   "flights": [
     {

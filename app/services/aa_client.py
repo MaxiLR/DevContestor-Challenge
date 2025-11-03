@@ -102,7 +102,10 @@ async def get_itinerary(
     }}
     """
 
-    async with acquire_page() as page:
+    # Route to appropriate browser based on search type
+    search_type = "Award" if award_search else "Revenue"
+
+    async with acquire_page(search_type) as page:
         result = await page.evaluate(
             js_code,
             {"apiUrl": API_URL, "payload": payload},

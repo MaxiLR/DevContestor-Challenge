@@ -22,7 +22,7 @@ async def flights_endpoint(
     ),
     passengers: int = Query(1, ge=1, le=9, description="Number of adult passengers."),
     cabin_class: str = Query(
-        "economy",
+        "main",
         description="Cabin cross-reference. Supported values: main, premium_economy.",
     ),
 ) -> FlightsResponse:
