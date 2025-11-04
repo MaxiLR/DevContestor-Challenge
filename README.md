@@ -74,6 +74,13 @@ docker build -t point-break .
 docker run --rm -p 8000:8000 point-break
 ```
 
+Alternatively, run the published image directly:
+```bash
+docker run --rm -p 8000:8000 maxilr/point-break:latest
+```
+
+Note: containerized runs may have constrained CPU, memory, or network resources, so observed performance might differ from bare-metal expectations.
+
 ## API Endpoints
 - `GET /health` → `{ "status": "ok" }`
 - `GET /flights` → accepts `origin`, `destination`, `date`, `passengers`, `cabin_class` as query string parameters and returns the pricing comparison payload.
