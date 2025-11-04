@@ -49,7 +49,7 @@ Putting that architecture in motion looks like this:
 
 **Latest achievements:**
 - Sustained 100+ sequential AA searches without rotating browser fingerprints or cooling down the Playwright session.
-- Completed a 15-minute load test at 6.81 requests/second (867 total) with 0.00% error rate and a 3,338 ms average response while maintaining bot-evasion parity.
+- Completed a 2-minute load test at 6.81 requests/second (867 total) with 0.00% error rate and a 3,338 ms average response while maintaining bot-evasion parity.
 
 ![Load test summary chart showing 867 requests with 0% errors](docs/assets/load-test-point-break.png)
 
