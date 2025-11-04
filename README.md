@@ -34,9 +34,9 @@ American Airlines hides the side-by-side comparison that would show whether cash
 ## Approach and Implementation
 Operation Point Break runs a FastAPI boundary layer that routes requests into three cooperating services: `browser_manager` (Playwright lifecycle and concurrency), `aa_client` (session-bound AA fetch wrapper), and `flight_service` (pricing merge + CPP math). The API layer injects these services per request so the business logic stays testable and the Pydantic response schemas remain the single source of truth for payload structure.
 
-Within the browser tier, the manager stands up dual WebKit and Firefox pairs, hydrates them through the AA booking flow, and uses a shared-page concurrency model so every incoming search can reuse a warm page rather than cold-starting a new context. A cooperative async dispatcher tracks request counts per page (rotating after 75), watches for Playwright crash signals, and brings replacement contexts online without dropping in-flight traffic. Session cookies and local storage are preserved across swaps to maintain bot-evasion parity.
+Within the browser tier, the manager stands up dual browser engines (WebKit + Firefox) to rotate fingerprints to evade AA's browser-level bot detection, hydrates them through the AA booking flow, and uses a shared-page concurrency model so every incoming search can reuse a warm page rather than cold-starting a new context. A cooperative async dispatcher tracks request counts per page (rotating after 75), watches for Playwright crash signals, and brings replacement contexts online without dropping in-flight traffic. Session cookies and local storage are preserved across swaps to maintain bot-evasion parity.
 
-Back-office work happens in the flight service: award and cash itineraries are fetched through the browser context, normalized to internal dataclasses, intersected on AA's `hash` identifier, and filtered down to cabins that expose complete pricing. The CPP calculation subtracts taxes/fees before dividing by redeemed points so the score reflects real value.
+Back-office work happens in the flight service: award and cash itineraries are fetched through the browser context, normalized to internal dataclasses, intersected on AA's `hash` identifier, and filtered down to cabins that expose complete pricing.
 
 Putting that architecture in motion looks like this:
 
