@@ -23,7 +23,7 @@ AA_HOMEPAGE_URL = "https://www.aa.com/"
 AA_BOOKING_URL = "https://www.aa.com/booking"  # Used for referer header in API requests
 AA_WARMUP_SELECTOR = '[id="flightSearchForm.button.reSubmit"]'
 AA_WARMUP_TIMEOUT = 10000  # 10 seconds
-_POOL_SIZE = 2
+_POOL_SIZE = 1
 _ROTATION_THRESHOLD = 75
 
 SearchType = Literal["Award", "Revenue"]
@@ -41,10 +41,8 @@ class BrowserPairState:
     cash_browser: Optional[Browser] = None
     award_context: Optional[BrowserContext] = None
     cash_context: Optional[BrowserContext] = None
-    award_bootstrap_page: Optional[Page] = None
-    cash_bootstrap_page: Optional[Page] = None
-    award_page_pool: Optional[asyncio.Queue[Page]] = None
-    cash_page_pool: Optional[asyncio.Queue[Page]] = None
+    award_page: Optional[Page] = None
+    cash_page: Optional[Page] = None
     healthy: bool = False
 
 
@@ -66,21 +64,8 @@ def _get_pair_state(pair_key: PairKey) -> BrowserPairState:
 async def _teardown_pair(state: BrowserPairState) -> None:
     """Release all Playwright resources for a browser pair."""
 
-    # Drain pools
-    for queue_attr in ("award_page_pool", "cash_page_pool"):
-        queue: Optional[asyncio.Queue[Page]] = getattr(state, queue_attr)
-        if queue:
-            setattr(state, queue_attr, None)
-            while True:
-                try:
-                    page = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if not page.is_closed():
-                    await page.close()
-
-    # Close bootstrap pages
-    for page_attr in ("award_bootstrap_page", "cash_bootstrap_page"):
+    # Close single pages
+    for page_attr in ("award_page", "cash_page"):
         page = getattr(state, page_attr)
         if page and not page.is_closed():
             await page.close()
@@ -142,24 +127,18 @@ async def _create_warmed_page(state: BrowserPairState, search_type: SearchType) 
     return page
 
 
-async def _ensure_page_pool(state: BrowserPairState, search_type: SearchType) -> None:
-    queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
-    bootstrap_attr = "award_bootstrap_page" if search_type == "Award" else "cash_bootstrap_page"
+async def _ensure_page(state: BrowserPairState, search_type: SearchType) -> None:
+    """Ensure a single warmed page exists for the specified search type."""
+    page_attr = "award_page" if search_type == "Award" else "cash_page"
 
-    queue: Optional[asyncio.Queue[Page]] = getattr(state, queue_attr)
-    if queue is not None:
+    # Check if page already exists and is healthy
+    existing_page = getattr(state, page_attr)
+    if existing_page and not existing_page.is_closed():
         return
 
-    queue = asyncio.Queue()
-    bootstrap_page = await _create_warmed_page(state, search_type)
-    await queue.put(bootstrap_page)
-    setattr(state, bootstrap_attr, bootstrap_page)
-
-    for _ in range(_POOL_SIZE - 1):
-        warmed = await _create_warmed_page(state, search_type)
-        await queue.put(warmed)
-
-    setattr(state, queue_attr, queue)
+    # Create new warmed page
+    page = await _create_warmed_page(state, search_type)
+    setattr(state, page_attr, page)
 
 
 async def _initialize_pair(pair_key: PairKey) -> None:
@@ -184,8 +163,8 @@ async def _initialize_pair(pair_key: PairKey) -> None:
         state.cash_context = await state.cash_browser.new_context()
 
         await asyncio.gather(
-            _ensure_page_pool(state, "Award"),
-            _ensure_page_pool(state, "Revenue"),
+            _ensure_page(state, "Award"),
+            _ensure_page(state, "Revenue"),
         )
         state.healthy = True
         logger.info("Initialized %s browser pair.", pair_key)
@@ -315,22 +294,18 @@ async def _record_successful_request() -> None:
 
 
 async def get_bootstrap_page(search_type: SearchType = "Award") -> Page:
-    """Get the bootstrap page for the specified search type from the active pair."""
+    """Get the shared page for the specified search type from the active pair."""
 
     await ensure_browser_started()
 
     async with _startup_lock:
         state = _get_pair_state(_active_pair)
-        page_attr = "award_bootstrap_page" if search_type == "Award" else "cash_bootstrap_page"
+        page_attr = "award_page" if search_type == "Award" else "cash_page"
         page = getattr(state, page_attr)
 
         if not page or page.is_closed():
             page = await _create_warmed_page(state, search_type)
             setattr(state, page_attr, page)
-            queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
-            queue = getattr(state, queue_attr)
-            if queue:
-                await queue.put(page)
 
         return page
 
@@ -347,32 +322,23 @@ def get_browser(search_type: SearchType = "Award") -> Browser:
 
 @asynccontextmanager
 async def acquire_page(search_type: SearchType) -> AsyncIterator[Page]:
-    """Acquire a page from the active pair pool for the specified search type."""
+    """Acquire the shared page for the specified search type from the active pair."""
 
     await ensure_browser_started()
 
     async with _startup_lock:
         pair_key = _active_pair
         state = _get_pair_state(pair_key)
-        queue_attr = "award_page_pool" if search_type == "Award" else "cash_page_pool"
-        queue = getattr(state, queue_attr)
+        page_attr = "award_page" if search_type == "Award" else "cash_page"
+        page = getattr(state, page_attr)
 
-        if queue is None:
-            raise RuntimeError(f"{search_type} page pool is not initialized for {pair_key}.")
-
-    page = await queue.get()
-    try:
-        if page.is_closed():
-            async with _startup_lock:
-                state = _get_pair_state(pair_key)
+        if page is None or page.is_closed():
+            # Create or recreate page if doesn't exist or is closed
             page = await _create_warmed_page(state, search_type)
-        yield page
-    finally:
-        async with _startup_lock:
-            state = _get_pair_state(pair_key)
-            queue = getattr(state, queue_attr)
-        if queue and not page.is_closed():
-            await queue.put(page)
+            setattr(state, page_attr, page)
+
+    # Yield the shared page reference (never "returned" to pool)
+    yield page
 
 
 async def register_successful_request() -> None:

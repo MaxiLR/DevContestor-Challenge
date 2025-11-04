@@ -32,11 +32,26 @@ American Airlines hides the side-by-side comparison that would show whether cash
 ```
 
 ## Approach and Implementation
-1. A Playwright session loads AA's booking page headlessly, then executes the itinerary `fetch` from inside the browser context with `credentials: include` so AA treats it like a real customer session (light bot evasion).
+Operation Point Break runs a FastAPI boundary layer that routes requests into three cooperating services: `browser_manager` (Playwright lifecycle and concurrency), `aa_client` (session-bound AA fetch wrapper), and `flight_service` (pricing merge + CPP math). The API layer injects these services per request so the business logic stays testable and the Pydantic response schemas remain the single source of truth for payload structure.
+
+Within the browser tier, the manager stands up dual WebKit and Firefox pairs, hydrates them through the AA booking flow, and uses a shared-page concurrency model so every incoming search can reuse a warm page rather than cold-starting a new context. A cooperative async dispatcher tracks request counts per page (rotating after 75), watches for Playwright crash signals, and brings replacement contexts online without dropping in-flight traffic. Session cookies and local storage are preserved across swaps to maintain bot-evasion parity.
+
+Back-office work happens in the flight service: award and cash itineraries are fetched through the browser context, normalized to internal dataclasses, intersected on AA's `hash` identifier, and filtered down to cabins that expose complete pricing. The CPP calculation subtracts taxes/fees before dividing by redeemed points so the score reflects real value.
+
+Putting that architecture in motion looks like this:
+
+1. A Playwright session loads AA's booking page headlessly, then executes the itinerary `fetch` from inside the browser with `credentials: include` so AA recognizes it as a live customer session.
 2. Two POSTs are issued per search: one for award pricing (`searchType="Award"`) and one for cash pricing (`searchType="Revenue"`).
 3. Flights are intersected via the shared `hash` field. Each surviving flight pulls departure/arrival timestamps, the relevant cabin product groups, and the per-passenger prices.
-4. CPP is computed as `(cash_price_usd - taxes_fees_usd) / points_required × 100`, rounded to two decimals. Responses that lack the needed pricing blocks are skipped.
+4. CPP is computed as `(cash_price_usd - taxes_fees_usd) / points_required * 100`, rounded to two decimals. Responses that lack the needed pricing blocks are skipped.
 5. FastAPI exposes `/flights` for the comparison and `/health` for readiness checks. Errors from AA's API propagate as `502` responses, while validation issues (e.g., unsupported cabin class) surface as `400`s.
+6. Connectivity is validated against multiple Surfshark exit nodes (Argentina, US, EU) to ensure the flows survive geo shifts; residential-style Surfshark IPs stay reliable, while data-center ranges get consistently blocked by AA.
+
+**Latest achievements:**
+- Sustained 100+ sequential AA searches without rotating browser fingerprints or cooling down the Playwright session.
+- Completed a 15-minute load test at 6.81 requests/second (867 total) with 0.00% error rate and a 3,338 ms average response while maintaining bot-evasion parity.
+
+![Load test summary chart showing 867 requests with 0% errors](docs/assets/load-test-point-break.png)
 
 ## Running Locally
 1. Install dependencies and browsers:
@@ -102,3 +117,6 @@ docker run --rm -p 8000:8000 point-break
 ## Additional Notes
 - The bot evasion strategy relies on Playwright maintaining real browser fingerprints and cookies. For higher resilience you can rotate user agents, add random delays, or proxy requests, though AA's current flows already accept this approach.
 - Extend the `AVAILABLE_CROSS_REFERENCES` list to support more cabins once AA exposes consistent identifiers for them across award and cash searches.
+
+## Explanation
+Further enhancement for perpetual functioning can be achieved by implementing a proxy rotation strategy on top of browser fingerprinting rotation to reduce proxy usage. To withstand bigger concurrent loads horizontal scalability of this service is suggested with an L4 Load Balancer.
